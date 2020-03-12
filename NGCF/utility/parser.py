@@ -39,7 +39,7 @@ def parse_args():
 
     parser.add_argument('--model_type', nargs='?', default='ngcf',
                         help='Specify the name of model (ngcf).')
-    parser.add_argument('--adj_type', nargs='?', default='norm',
+    parser.add_argument('--adj_type', nargs='?', default='mean',
                         help='Specify the type of the adjacency (laplacian) matrix from {plain, norm, mean}.')
     parser.add_argument('--alg_type', nargs='?', default='ngcf',
                         help='Specify the type of the graph convolutional layer from {ngcf, gcn, gcmc}.')
@@ -65,4 +65,11 @@ def parse_args():
 
     parser.add_argument('--report', type=int, default=0,
                         help='0: Disable performance report w.r.t. sparsity levels, 1: Show performance report w.r.t. sparsity levels')
+    parser.add_argument('--code_version', type=str, default='')
+    parser.add_argument('--activate_flag', type=int, default=0)
+    parser.add_argument('--trans_flag', type=int, default=0)
+    parser.add_argument('--layer_combina_flag', type=int, default=1)
+    parser.add_argument('--lambda_', type=float, default=1e-4)
+
+    
     return parser.parse_args()

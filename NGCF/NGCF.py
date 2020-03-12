@@ -19,6 +19,9 @@ class NGCF(object):
         self.model_type = 'ngcf'
         self.adj_type = args.adj_type
         self.alg_type = args.alg_type
+        self.activate_flag = args.activate_flag
+        self.trans_flag = args.trans_flag
+        self.layer_combina_flag = args.layer_combina_flag
 
         self.pretrain_data = pretrain_data
 
@@ -44,7 +47,7 @@ class NGCF(object):
         self.decay = self.regs[0]
 
         self.verbose = args.verbose
-
+        self.lambda_ = args.lambda_
         '''
         *********************************************************
         Create Placeholder for Input Data & Dropout.
@@ -78,14 +81,13 @@ class NGCF(object):
             3. gcmc: defined in 'Graph Convolutional Matrix Completion', KDD2018;
         """
         if self.alg_type in ['ngcf']:
-            self.ua_embeddings, self.ia_embeddings = self._create_ngcf_embed()
+            self.ua_embeddings, self.ia_embeddings, self.reg_loss = self._create_ngcf_embed()
 
         elif self.alg_type in ['gcn']:
             self.ua_embeddings, self.ia_embeddings = self._create_gcn_embed()
 
         elif self.alg_type in ['gcmc']:
             self.ua_embeddings, self.ia_embeddings = self._create_gcmc_embed()
-
         """
         *********************************************************
         Establish the final representations for user-item pairs in batch.
@@ -104,10 +106,8 @@ class NGCF(object):
         *********************************************************
         Generate Predictions & Optimize via BPR loss.
         """
-        self.mf_loss, self.emb_loss, self.reg_loss = self.create_bpr_loss(self.u_g_embeddings,
-                                                                          self.pos_i_g_embeddings,
-                                                                          self.neg_i_g_embeddings)
-        self.loss = self.mf_loss + self.emb_loss + self.reg_loss
+        self.mf_loss = self.create_bpr_loss(self.u_g_embeddings,self.pos_i_g_embeddings,self.neg_i_g_embeddings)
+        self.loss = self.mf_loss + self.reg_loss
 
         self.opt = tf.train.AdamOptimizer(learning_rate=self.lr).minimize(self.loss)
 
@@ -189,7 +189,8 @@ class NGCF(object):
 
         ego_embeddings = tf.concat([self.weights['user_embedding'], self.weights['item_embedding']], axis=0)
 
-        all_embeddings = [ego_embeddings]
+        all_embeddings = ego_embeddings
+        reg_loss = tf.contrib.layers.l2_regularizer(self.lambda_)(ego_embeddings)
 
         for k in range(0, self.n_layers):
 
@@ -197,32 +198,33 @@ class NGCF(object):
             for f in range(self.n_fold):
                 temp_embed.append(tf.sparse_tensor_dense_matmul(A_fold_hat[f], ego_embeddings))
 
-            # sum messages of neighbors.
-            side_embeddings = tf.concat(temp_embed, 0)
+            # sum messages of neighbors. without self-connet
+            norm_embeddings = tf.concat(temp_embed, 0)
             # transformed sum messages of neighbors.
-            sum_embeddings = tf.nn.leaky_relu(
-                tf.matmul(side_embeddings, self.weights['W_gc_%d' % k]) + self.weights['b_gc_%d' % k])
+            if self.trans_flag:
+                side_embeddings = norm_embeddings + ego_embeddings  # add self-connet
+                sum_embeddings = tf.matmul(side_embeddings, self.weights['W_gc_%d' % k]) + self.weights['b_gc_%d' % k]
 
-            # bi messages of neighbors.
-            bi_embeddings = tf.multiply(ego_embeddings, side_embeddings)
-            # transformed bi messages of neighbors.
-            bi_embeddings = tf.nn.leaky_relu(
-                tf.matmul(bi_embeddings, self.weights['W_bi_%d' % k]) + self.weights['b_bi_%d' % k])
+                # bi messages of neighbors.
+                bi_embeddings = tf.multiply(ego_embeddings, norm_embeddings)
+                # transformed bi messages of neighbors.
+                bi_embeddings = tf.matmul(bi_embeddings, self.weights['W_bi_%d' % k]) + self.weights['b_bi_%d' % k]
 
+                norm_embeddings = sum_embeddings + bi_embeddings
             # non-linear activation.
-            ego_embeddings = sum_embeddings + bi_embeddings
-
+            if self.activate_flag:
+                norm_embeddings = tf.nn.leaky_relu(norm_embeddings)
             # message dropout.
-            ego_embeddings = tf.nn.dropout(ego_embeddings, 1 - self.mess_dropout[k])
+            # ego_embeddings = tf.nn.dropout(ego_embeddings, 1 - self.mess_dropout[k])
 
+            ego_embeddings = norm_embeddings
             # normalize the distribution of embeddings.
-            norm_embeddings = tf.math.l2_normalize(ego_embeddings, axis=1)
 
-            all_embeddings += [norm_embeddings]
+            all_embeddings = all_embeddings + ego_embeddings
 
-        all_embeddings = tf.concat(all_embeddings, 1)
-        u_g_embeddings, i_g_embeddings = tf.split(all_embeddings, [self.n_users, self.n_items], 0)
-        return u_g_embeddings, i_g_embeddings
+        combina_embeddings = all_embeddings/self.n_layers
+        u_g_embeddings, i_g_embeddings = tf.split(combina_embeddings, [self.n_users, self.n_items], 0)
+        return u_g_embeddings, i_g_embeddings, reg_loss
 
     def _create_gcn_embed(self):
         A_fold_hat = self._split_A_hat(self.norm_adj)
@@ -275,17 +277,17 @@ class NGCF(object):
         pos_scores = tf.reduce_sum(tf.multiply(users, pos_items), axis=1)
         neg_scores = tf.reduce_sum(tf.multiply(users, neg_items), axis=1)
 
-        regularizer = tf.nn.l2_loss(users) + tf.nn.l2_loss(pos_items) + tf.nn.l2_loss(neg_items)
-        regularizer = regularizer/self.batch_size
+        # regularizer = tf.nn.l2_loss(users) + tf.nn.l2_loss(pos_items) + tf.nn.l2_loss(neg_items)
+        # regularizer = regularizer/self.batch_size
 
         maxi = tf.log(tf.nn.sigmoid(pos_scores - neg_scores))
         mf_loss = tf.negative(tf.reduce_mean(maxi))
 
-        emb_loss = self.decay * regularizer
+        # emb_loss = self.decay * regularizer
 
-        reg_loss = tf.constant(0.0, tf.float32, [1])
+        # reg_loss = tf.constant(0.0, tf.float32, [1])
 
-        return mf_loss, emb_loss, reg_loss
+        return mf_loss
 
     def _convert_sp_mat_to_sp_tensor(self, X):
         coo = X.tocoo().astype(np.float32)
@@ -334,7 +336,7 @@ if __name__ == '__main__':
         config['norm_adj'] = norm_adj
         print('use the normalized adjacency matrix')
 
-    elif args.adj_type == 'gcmc':
+    elif args.adj_type == 'mean':
         config['norm_adj'] = mean_adj
         print('use the gcmc adjacency matrix')
 
@@ -423,8 +425,8 @@ if __name__ == '__main__':
         ensureDir(report_path)
         f = open(report_path, 'w')
         f.write(
-            'embed_size=%d, lr=%.4f, layer_size=%s, keep_prob=%s, regs=%s, loss_type=%s, adj_type=%s\n'
-            % (args.embed_size, args.lr, args.layer_size, args.keep_prob, args.regs, args.loss_type, args.adj_type))
+            'embed_size=%d, lr=%.4f, layer_size=%s, regs=%s, adj_type=%s\n'
+            % (args.embed_size, args.lr, args.layer_size, args.regs, args.adj_type))
 
         for i, users_to_test in enumerate(users_to_test_list):
             ret = test(sess, model, users_to_test, drop_flag=True)
@@ -450,21 +452,20 @@ if __name__ == '__main__':
 
     for epoch in range(args.epoch):
         t1 = time()
-        loss, mf_loss, emb_loss, reg_loss = 0., 0., 0., 0.
+        loss, mf_loss, reg_loss = 0., 0., 0.
         n_batch = data_generator.n_train // args.batch_size + 1
 
         for idx in range(n_batch):
             users, pos_items, neg_items = data_generator.sample()
-            _, batch_loss, batch_mf_loss, batch_emb_loss, batch_reg_loss = sess.run([model.opt, model.loss, model.mf_loss, model.emb_loss, model.reg_loss],
+            _, batch_loss, batch_mf_loss, batch_reg_loss = sess.run([model.opt, model.loss, model.mf_loss, model.reg_loss],
                                feed_dict={model.users: users, model.pos_items: pos_items,
                                           model.node_dropout: eval(args.node_dropout),
                                           model.mess_dropout: eval(args.mess_dropout),
                                           model.neg_items: neg_items})
             loss += batch_loss
             mf_loss += batch_mf_loss
-            emb_loss += batch_emb_loss
             reg_loss += batch_reg_loss
-
+            
         if np.isnan(loss) == True:
             print('ERROR: loss is nan.')
             sys.exit()
@@ -490,9 +491,9 @@ if __name__ == '__main__':
         hit_loger.append(ret['hit_ratio'])
 
         if args.verbose > 0:
-            perf_str = 'Epoch %d [%.1fs + %.1fs]: train==[%.5f=%.5f + %.5f + %.5f], recall=[%.5f, %.5f], ' \
+            perf_str = 'Epoch %d [%.1fs + %.1fs]: train==[%.5f=%.5f + %.5f], recall=[%.5f, %.5f], ' \
                        'precision=[%.5f, %.5f], hit=[%.5f, %.5f], ndcg=[%.5f, %.5f]' % \
-                       (epoch, t2 - t1, t3 - t2, loss, mf_loss, emb_loss, reg_loss, ret['recall'][0], ret['recall'][-1],
+                       (epoch, t2 - t1, t3 - t2, loss, mf_loss, reg_loss, ret['recall'][0], ret['recall'][-1],
                         ret['precision'][0], ret['precision'][-1], ret['hit_ratio'][0], ret['hit_ratio'][-1],
                         ret['ndcg'][0], ret['ndcg'][-1])
             print(perf_str)
@@ -531,7 +532,7 @@ if __name__ == '__main__':
     f = open(save_path, 'a')
 
     f.write(
-        'embed_size=%d, lr=%.4f, layer_size=%s, node_dropout=%s, mess_dropout=%s, regs=%s, adj_type=%s\n\t%s\n'
+        'embed_size=%d, lr=%.4f, layer_size=%s, node_dropout=%s, mess_dropout=%s, regs=%s, adj_type=%s\n, code_version=%s\t%s\n'
         % (args.embed_size, args.lr, args.layer_size, args.node_dropout, args.mess_dropout, args.regs,
-           args.adj_type, final_perf))
+           args.adj_type, args.code_version,final_perf))
     f.close()
